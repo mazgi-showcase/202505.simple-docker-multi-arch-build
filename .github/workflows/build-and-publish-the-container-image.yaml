@@ -1,0 +1,101 @@
+name: build-and-publish-the-container-image
+
+on:
+  push:
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+jobs:
+  build-and-push-each-image:
+    strategy:
+        matrix:
+          arch:
+            - platform: linux/amd64
+              runner: ubuntu-24.04
+            - platform: linux/arm64
+              runner: ubuntu-24.04-arm
+          version:
+            - version: "1.37.0"
+            - version: "1.36.1"
+    runs-on: ${{ matrix.arch.runner }}
+    steps:
+      - id: docker-metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/202505.simple-docker-multi-arch-build-busybox
+      - uses: actions/checkout@v4
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Push docker image digest
+        id: build-and-push-image
+        uses: docker/build-push-action@v6
+        with:
+          build-args: BUSYBOX_VERSION=${{ matrix.version.version }}
+          labels: ${{ steps.docker-metadata.outputs.labels }}
+          platforms: ${{ matrix.arch.platform }}
+          provenance: false
+          tags: ghcr.io/${{ github.repository_owner }}/202505.simple-docker-multi-arch-build-busybox
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests/${{ matrix.version.version }}/
+          digest="${{ steps.build-and-push-image.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${{ matrix.version.version }}/${digest#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.version.version }}-${{ matrix.arch.runner }}
+          path: ${{ runner.temp }}/digests/${{ matrix.version.version }}/*
+          if-no-files-found: error
+          retention-days: 1
+  merge-and-push-digests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version:
+          - version: "1.37.0"
+            latest: true
+          - version: "1.36.1"
+            latest: false
+    needs:
+      - build-and-push-each-image
+    steps:
+      - name: Download digests each version
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests/${{ matrix.version.version }}/
+          pattern: digests-${{ matrix.version.version }}-*
+          merge-multiple: true
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - id: docker-metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/202505.simple-docker-multi-arch-build-busybox
+          tags: |
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=${{ matrix.version.version }},enable={{is_default_branch}}
+            # Enable `latest` tag when the branch is default and the version is latest.
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') && matrix.version.latest }}
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests/${{ matrix.version.version }}/
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+           $(printf 'ghcr.io/${{ github.repository_owner }}/202505.simple-docker-multi-arch-build-busybox@sha256:%s ' *)
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/202505.simple-docker-multi-arch-build-busybox:${{ steps.docker-metadata.outputs.version }}
